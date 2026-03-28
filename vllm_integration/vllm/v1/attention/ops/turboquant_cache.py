@@ -6,6 +6,12 @@ Write path:  normalize → rotate by Π → scalar quantize → pack b-bit → s
 Read path:   gather packed → unpack → centroid lookup → scale by norm
              (stays in rotated space; query-rotation trick avoids Π^T)
 
+Rotation modes:
+  - "hadamard" (default): Randomized Walsh-Hadamard Transform.
+    O(d log d) per vector, stores only d random signs (512 B for d=128).
+  - "matrix": Full random orthogonal matrix via QR decomposition.
+    O(d²) per vector, stores d×d float32 (64 KB for d=128).
+
 Storage layout per token per KV head (2-bit, head_size=128):
   - 32 bytes packed indices (4 values per uint8)
   - 4 bytes float32 norm (stored in separate auxiliary buffer)
@@ -36,8 +42,45 @@ def packed_dim(head_size: int, bit_width: int = TURBOQUANT_BIT_WIDTH) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Fast Walsh-Hadamard Transform — O(d log d) rotation
+# ---------------------------------------------------------------------------
+
+
+def _fast_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
+    """Normalized Fast Walsh-Hadamard Transform along last dimension.
+
+    Butterfly decomposition: log2(d) vectorized steps, O(d log d) total.
+    The normalized WHT matrix is symmetric and orthogonal (its own inverse).
+    Requires d to be a power of 2.
+    """
+    d = x.shape[-1]
+    batch_shape = x.shape[:-1]
+    result = x.float()
+    h = 1
+    while h < d:
+        groups = d // (2 * h)
+        result = result.view(*batch_shape, groups, 2, h)
+        a = result[..., 0, :] + result[..., 1, :]
+        b = result[..., 0, :] - result[..., 1, :]
+        result = torch.stack([a, b], dim=-2).reshape(*batch_shape, d)
+        h *= 2
+    return result * (1.0 / math.sqrt(d))
+
+
+def _generate_rademacher_signs(
+    dim: int, device: torch.device, seed: int,
+) -> torch.Tensor:
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed)
+    return (
+        torch.randint(0, 2, (dim,), generator=gen, device=device) * 2 - 1
+    ).float()
+
+
+# ---------------------------------------------------------------------------
 # Codebook solver (runs once at init, cached)
 # ---------------------------------------------------------------------------
+
 
 def _beta_pdf_centroids(
     dim: int, n_centroids: int, max_iters: int = 500,
@@ -145,9 +188,10 @@ if HAS_TRITON:
         BLOCK_D: tl.constexpr,
         BIT_WIDTH: tl.constexpr,
     ):
-        """Fused normalize → rotate → quantize → pack → scatter.
+        """Fused normalize -> rotate -> quantize -> pack -> scatter.
 
         Grid: (num_tokens, num_heads)
+        Uses full rotation matrix path (for non-Hadamard mode).
         """
         token_id = tl.program_id(0)
         head_id = tl.program_id(1)
@@ -203,33 +247,35 @@ if HAS_TRITON:
         for sub in range(vals_per_byte):
             col = pack_range * vals_per_byte + sub
             col_mask = col < D
-            idx_val = tl.where(
+            idx_at_col = tl.where(
                 col_mask,
                 tl.load(
-                    boundaries_ptr + tl.zeros([BLOCK_D], dtype=tl.int32),
-                    mask=tl.zeros([BLOCK_D], dtype=tl.int1),
-                    other=0,
+                    kv_ptr + src_off + col,
+                    mask=col_mask,
+                    other=0.0,
                 ),
-                tl.zeros([BLOCK_D], dtype=tl.int32),
+                tl.zeros([BLOCK_D], dtype=tl.float32),
             )
+            _ = idx_at_col
+            rotated_at_col = tl.zeros([BLOCK_D], dtype=tl.float32)
+            for k in range(D):
+                x_k = tl.load(kv_ptr + src_off + k).to(tl.float32)
+                x_k = x_k / norm
+                rot_elem = tl.where(
+                    col_mask,
+                    tl.load(
+                        rotation_ptr + col * D + k,
+                        mask=col_mask,
+                        other=0.0,
+                    ),
+                    tl.zeros([BLOCK_D], dtype=tl.float32),
+                )
+                rotated_at_col += x_k * rot_elem
+            idx_val = tl.zeros([BLOCK_D], dtype=tl.int32)
             for bi in range(n_boundaries):
                 b = tl.load(boundaries_ptr + bi)
-                r_val = tl.zeros([BLOCK_D], dtype=tl.float32)
-                for k in range(D):
-                    x_k = tl.load(kv_ptr + src_off + k).to(tl.float32)
-                    x_k = x_k / norm
-                    rot_elem = tl.where(
-                        col_mask,
-                        tl.load(
-                            rotation_ptr + col * D + k,
-                            mask=col_mask,
-                            other=0.0,
-                        ),
-                        tl.zeros([BLOCK_D], dtype=tl.float32),
-                    )
-                    r_val += x_k * rot_elem
                 idx_val += tl.where(
-                    col_mask & (r_val >= b), 1, 0,
+                    col_mask & (rotated_at_col >= b), 1, 0,
                 )
             shift = (sub * BIT_WIDTH)
             packed |= (
@@ -263,7 +309,7 @@ if HAS_TRITON:
         BIT_WIDTH: tl.constexpr,
         BLOCK_D: tl.constexpr,
     ):
-        """Unpack → centroid gather → scale by norm.
+        """Unpack -> centroid gather -> scale by norm.
 
         Output is in rotated space (no inverse rotation).
         Grid: (num_blocks * block_size, num_heads)
@@ -347,7 +393,9 @@ def _pytorch_unpack(
         N, head_size, dtype=torch.long, device=packed.device,
     )
     for sub in range(vals_per_byte):
-        cols = torch.arange(sub, head_size, vals_per_byte, device=packed.device)
+        cols = torch.arange(
+            sub, head_size, vals_per_byte, device=packed.device,
+        )
         byte_col = torch.arange(len(cols), device=packed.device)
         shift = sub * bit_width
         indices[:, cols] = (flat[:, byte_col].long() >> shift) & mask
@@ -365,8 +413,15 @@ _tq_layer_counter = 0
 class TurboQuantState:
     """Per-layer state for TurboQuant KV cache quantization.
 
-    Holds the rotation matrix, codebook, and per-token norm buffers.
+    Holds rotation parameters, codebook, and per-token norm buffers.
     Initialized once per attention layer at model load time.
+
+    Two rotation modes:
+      - "hadamard": Randomized Walsh-Hadamard Transform.
+        Stores d random ±1 signs (512 B for d=128).
+        Forward/inverse are O(d log d) via butterfly decomposition.
+      - "matrix": Full random orthogonal matrix via QR.
+        Stores d×d matrix (64 KB for d=128). O(d²) per vector.
     """
 
     def __init__(
@@ -376,6 +431,7 @@ class TurboQuantState:
         device: torch.device,
         bit_width: int = TURBOQUANT_BIT_WIDTH,
         layer_idx: int | None = None,
+        rotation_mode: str = "hadamard",
     ):
         global _tq_layer_counter  # noqa: PLW0603
         if layer_idx is None:
@@ -387,11 +443,25 @@ class TurboQuantState:
         self.bit_width = bit_width
         self.packed_dim = packed_dim(head_size, bit_width)
         self.vals_per_byte = 8 // bit_width
+        self.rotation_mode = rotation_mode
 
         seed = ROTATION_BASE_SEED + layer_idx
-        self.rotation = generate_rotation_matrix(
-            head_size, device, seed=seed,
-        )
+
+        if rotation_mode == "hadamard":
+            if head_size & (head_size - 1) != 0:
+                raise ValueError(
+                    f"Hadamard rotation requires head_size to be a "
+                    f"power of 2, got {head_size}",
+                )
+            self.signs = _generate_rademacher_signs(
+                head_size, device, seed,
+            )
+            self.rotation = None
+        else:
+            self.rotation = generate_rotation_matrix(
+                head_size, device, seed=seed,
+            )
+            self.signs = None
 
         centroids, boundaries = get_codebook(
             head_size, bit_width, str(device),
@@ -399,8 +469,20 @@ class TurboQuantState:
         self.centroids = centroids
         self.boundaries = boundaries
 
-        self._norm_caches: dict[tuple[int, int], torch.Tensor] = {}
+        self._norm_caches: dict[tuple[int, int, int], torch.Tensor] = {}
         self._use_triton = HAS_TRITON and device.type == "cuda"
+
+    def rotate_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the rotation Π to x.  O(d log d) for Hadamard, O(d²) for matrix."""
+        if self.rotation_mode == "hadamard":
+            return _fast_hadamard_transform(x * self.signs)
+        return (x.float() @ self.rotation.T).to(x.dtype)
+
+    def rotate_inverse(self, y: torch.Tensor) -> torch.Tensor:
+        """Apply Π^T to y (undo rotation).  Same cost as forward."""
+        if self.rotation_mode == "hadamard":
+            return _fast_hadamard_transform(y) * self.signs
+        return (y.float() @ self.rotation).to(y.dtype)
 
     def get_norm_cache(
         self, num_blocks: int, block_size: int, kv_idx: int,
@@ -416,8 +498,9 @@ class TurboQuantState:
 
 
 # ---------------------------------------------------------------------------
-# Write path
+# Write path — vectorized scatter (no Python per-token loop)
 # ---------------------------------------------------------------------------
+
 
 def turboquant_reshape_and_cache(
     key: torch.Tensor,
@@ -431,60 +514,65 @@ def turboquant_reshape_and_cache(
 ):
     """Write K/V into packed quantized cache using TurboQuant.
 
+    Fully vectorized: quantizes all tokens in parallel, then scatters
+    to the paged cache via advanced indexing (no Python for-loop).
+
     Args:
         key:         [num_tokens, num_kv_heads, head_size]
         value:       [num_tokens, num_kv_heads, head_size]
         key_cache:   [num_blocks, block_size, num_kv_heads, packed_dim] uint8
         value_cache: [num_blocks, block_size, num_kv_heads, packed_dim] uint8
-        slot_mapping: [num_tokens]
+        slot_mapping: [num_tokens]  (-1 = padding, skip)
         tq_state:    TurboQuantState
         k_norm_cache: [num_blocks * block_size * num_kv_heads] float32
         v_norm_cache: [num_blocks * block_size * num_kv_heads] float32
     """
     head_size = tq_state.head_size
     bit_width = tq_state.bit_width
-    rotation = tq_state.rotation
     boundaries = tq_state.boundaries
     block_size = key_cache.shape[1]
     num_heads = key.shape[1]
-    num_tokens = key.shape[0]
 
-    for kv_idx, (tensor, cache, norm_buf) in enumerate([
+    valid = slot_mapping >= 0
+    if not valid.any():
+        return
+    valid_slots = slot_mapping[valid]
+    block_idx = valid_slots // block_size
+    block_off = valid_slots % block_size
+
+    for tensor, cache, norm_buf in [
         (key, key_cache, k_norm_cache),
         (value, value_cache, v_norm_cache),
-    ]):
+    ]:
         flat = tensor.float()
         norms = torch.norm(flat, dim=-1, keepdim=True).clamp(min=1e-8)
         normalized = flat / norms
 
-        orig_shape = normalized.shape
-        flat_vecs = normalized.reshape(-1, head_size)
-        rotated = flat_vecs @ rotation.T
-        rotated = rotated.reshape(orig_shape)
+        rotated = tq_state.rotate_forward(normalized)
 
         indices = torch.bucketize(rotated, boundaries)
         packed = _pytorch_pack(indices, head_size, bit_width)
 
-        for t in range(num_tokens):
-            slot = slot_mapping[t].item()
-            if slot < 0:
-                continue
-            block_idx = slot // block_size
-            block_off = slot % block_size
+        cache[block_idx, block_off] = packed[valid].to(torch.uint8)
 
-            cache[block_idx, block_off] = packed[t].to(torch.uint8)
-            flat_slot = (
-                block_idx * block_size * num_heads
-                + block_off * num_heads
-            )
-            norm_buf[flat_slot: flat_slot + num_heads] = (
-                norms[t, :, 0]
-            )
+        flat_base = (
+            block_idx * block_size * num_heads
+            + block_off * num_heads
+        )
+        head_offsets = torch.arange(
+            num_heads, device=flat_base.device,
+        )
+        scatter_idx = (
+            flat_base.unsqueeze(1) + head_offsets.unsqueeze(0)
+        ).reshape(-1)
+        norm_vals = norms[valid, :, 0].reshape(-1)
+        norm_buf.scatter_(0, scatter_idx, norm_vals)
 
 
 # ---------------------------------------------------------------------------
 # Read path — query-rotation trick
 # ---------------------------------------------------------------------------
+
 
 def turboquant_dequant_rotated(
     cache: torch.Tensor,
@@ -556,9 +644,7 @@ def turboquant_dequantize_for_attention(
     Instead of applying Π^T to every cache entry, rotate q by Π once.
     Returns (rotated_query, key_dequant_rotated, value_dequant_rotated).
     """
-    rotated_query = (
-        query.float() @ tq_state.rotation.T
-    ).to(target_dtype)
+    rotated_query = tq_state.rotate_forward(query).to(target_dtype)
 
     key_deq = turboquant_dequant_rotated(
         key_cache, k_norm_cache, tq_state, target_dtype,
@@ -569,7 +655,6 @@ def turboquant_dequantize_for_attention(
     return rotated_query, key_deq, val_deq
 
 
-# legacy compat — full dequant with inverse rotation (slower)
 def turboquant_dequantize_cache(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
@@ -578,7 +663,7 @@ def turboquant_dequantize_cache(
     v_norm_cache: torch.Tensor,
     target_dtype: torch.dtype = torch.float16,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    rotation = tq_state.rotation
+    """Full dequantization with inverse rotation (legacy path, slower)."""
     head_size = tq_state.head_size
 
     results: list[torch.Tensor] = []
@@ -591,7 +676,7 @@ def turboquant_dequantize_cache(
         )
         shape = rotated.shape
         flat = rotated.reshape(-1, head_size)
-        unrotated = flat @ rotation
+        unrotated = tq_state.rotate_inverse(flat)
         results.append(
             unrotated.reshape(shape).to(target_dtype)
         )

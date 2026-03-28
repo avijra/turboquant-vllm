@@ -1,7 +1,8 @@
 """Integration tests for TurboQuant vLLM integration.
 
 Validates config registration, dtype mapping, sub-byte packing,
-query-rotation trick, and cache shape computation.
+query-rotation trick, cache shape computation, and both rotation modes
+(Hadamard and full matrix).
 """
 
 from __future__ import annotations
@@ -103,7 +104,43 @@ class TestPackUnpack:
         assert torch.equal(indices, unpacked)
 
 
-class TestTurboQuantState:
+class TestFastHadamardTransform:
+    def test_orthogonality(self):
+        from vllm.v1.attention.ops.turboquant_cache import (
+            _fast_hadamard_transform,
+        )
+
+        d = 128
+        x = torch.randn(d)
+        hx = _fast_hadamard_transform(x)
+        assert torch.allclose(
+            torch.dot(x, x), torch.dot(hx, hx), atol=1e-4,
+        ), "Hadamard should preserve L2 norm"
+
+    def test_is_own_inverse(self):
+        from vllm.v1.attention.ops.turboquant_cache import (
+            _fast_hadamard_transform,
+        )
+
+        d = 64
+        x = torch.randn(8, d)
+        hx = _fast_hadamard_transform(x)
+        hhx = _fast_hadamard_transform(hx)
+        assert torch.allclose(x, hhx, atol=1e-5), (
+            "Normalized WHT should be its own inverse"
+        )
+
+    def test_batched(self):
+        from vllm.v1.attention.ops.turboquant_cache import (
+            _fast_hadamard_transform,
+        )
+
+        x = torch.randn(4, 8, 128)
+        hx = _fast_hadamard_transform(x)
+        assert hx.shape == x.shape
+
+
+class TestTurboQuantStateHadamard:
     @pytest.fixture
     def tq_state(self):
         from vllm.v1.attention.ops.turboquant_cache import TurboQuantState
@@ -114,30 +151,69 @@ class TestTurboQuantState:
             device=torch.device("cpu"),
             bit_width=2,
             layer_idx=42,
+            rotation_mode="hadamard",
         )
 
     def test_packed_dim(self, tq_state):
         assert tq_state.packed_dim == 16
         assert tq_state.vals_per_byte == 4
 
-    def test_rotation_orthogonal(self, tq_state):
-        R = tq_state.rotation
-        identity = R @ R.T
-        assert torch.allclose(identity, torch.eye(64), atol=1e-5)
+    def test_hadamard_signs_stored(self, tq_state):
+        assert tq_state.signs is not None
+        assert tq_state.signs.shape == (64,)
+        assert tq_state.rotation is None
+        assert set(tq_state.signs.tolist()) == {-1.0, 1.0}
 
-    def test_deterministic_rotation(self):
+    def test_rotation_mode(self, tq_state):
+        assert tq_state.rotation_mode == "hadamard"
+
+    def test_rotate_preserves_norm(self, tq_state):
+        x = torch.randn(8, 64)
+        rotated = tq_state.rotate_forward(x)
+        orig_norms = torch.norm(x, dim=-1)
+        rot_norms = torch.norm(rotated, dim=-1)
+        assert torch.allclose(orig_norms, rot_norms, atol=1e-4)
+
+    def test_rotate_inverse_roundtrip(self, tq_state):
+        x = torch.randn(8, 64)
+        rotated = tq_state.rotate_forward(x)
+        recovered = tq_state.rotate_inverse(rotated)
+        assert torch.allclose(x, recovered, atol=1e-4)
+
+    def test_deterministic_signs(self):
         from vllm.v1.attention.ops.turboquant_cache import TurboQuantState
 
-        s1 = TurboQuantState(64, 4, torch.device("cpu"), 2, layer_idx=7)
-        s2 = TurboQuantState(64, 4, torch.device("cpu"), 2, layer_idx=7)
-        assert torch.equal(s1.rotation, s2.rotation)
+        s1 = TurboQuantState(
+            64, 4, torch.device("cpu"), 2, layer_idx=7,
+            rotation_mode="hadamard",
+        )
+        s2 = TurboQuantState(
+            64, 4, torch.device("cpu"), 2, layer_idx=7,
+            rotation_mode="hadamard",
+        )
+        assert torch.equal(s1.signs, s2.signs)
 
-    def test_different_layers_different_rotation(self):
+    def test_different_layers_different_signs(self):
         from vllm.v1.attention.ops.turboquant_cache import TurboQuantState
 
-        s1 = TurboQuantState(64, 4, torch.device("cpu"), 2, layer_idx=0)
-        s2 = TurboQuantState(64, 4, torch.device("cpu"), 2, layer_idx=1)
-        assert not torch.equal(s1.rotation, s2.rotation)
+        s1 = TurboQuantState(
+            64, 4, torch.device("cpu"), 2, layer_idx=0,
+            rotation_mode="hadamard",
+        )
+        s2 = TurboQuantState(
+            64, 4, torch.device("cpu"), 2, layer_idx=1,
+            rotation_mode="hadamard",
+        )
+        assert not torch.equal(s1.signs, s2.signs)
+
+    def test_non_power_of_2_raises(self):
+        from vllm.v1.attention.ops.turboquant_cache import TurboQuantState
+
+        with pytest.raises(ValueError, match="power of 2"):
+            TurboQuantState(
+                65, 4, torch.device("cpu"), 2, layer_idx=0,
+                rotation_mode="hadamard",
+            )
 
     def test_codebook_for_2bit(self, tq_state):
         assert tq_state.centroids.shape == (4,)
@@ -155,9 +231,36 @@ class TestTurboQuantState:
         assert nc_v is not nc
 
 
+class TestTurboQuantStateMatrix:
+    def test_matrix_mode_stores_rotation(self):
+        from vllm.v1.attention.ops.turboquant_cache import TurboQuantState
+
+        tq = TurboQuantState(
+            64, 4, torch.device("cpu"), 2, layer_idx=99,
+            rotation_mode="matrix",
+        )
+        assert tq.rotation is not None
+        assert tq.rotation.shape == (64, 64)
+        assert tq.signs is None
+        identity = tq.rotation @ tq.rotation.T
+        assert torch.allclose(identity, torch.eye(64), atol=1e-5)
+
+    def test_matrix_rotate_roundtrip(self):
+        from vllm.v1.attention.ops.turboquant_cache import TurboQuantState
+
+        tq = TurboQuantState(
+            64, 4, torch.device("cpu"), 2, layer_idx=99,
+            rotation_mode="matrix",
+        )
+        x = torch.randn(8, 64)
+        rotated = tq.rotate_forward(x)
+        recovered = tq.rotate_inverse(rotated)
+        assert torch.allclose(x, recovered, atol=1e-4)
+
+
 class TestWriteAndReadRoundTrip:
-    @pytest.fixture
-    def setup(self):
+    @pytest.fixture(params=["hadamard", "matrix"])
+    def setup(self, request):
         from vllm.v1.attention.ops.turboquant_cache import TurboQuantState
 
         tq = TurboQuantState(
@@ -166,6 +269,7 @@ class TestWriteAndReadRoundTrip:
             device=torch.device("cpu"),
             bit_width=2,
             layer_idx=99,
+            rotation_mode=request.param,
         )
         num_blocks = 2
         block_size = 16
@@ -256,7 +360,11 @@ class TestWriteAndReadRoundTrip:
 
 
 class TestQueryRotationTrick:
-    def test_rotation_preserves_dot_product(self):
+    @pytest.fixture(params=["hadamard", "matrix"])
+    def rotation_mode(self, request):
+        return request.param
+
+    def test_rotation_preserves_dot_product(self, rotation_mode):
         from vllm.v1.attention.ops.turboquant_cache import (
             TurboQuantState,
             turboquant_dequant_rotated,
@@ -266,6 +374,7 @@ class TestQueryRotationTrick:
 
         tq = TurboQuantState(
             64, 4, torch.device("cpu"), bit_width=2, layer_idx=200,
+            rotation_mode=rotation_mode,
         )
         num_blocks, block_size = 1, 16
         num_tokens, num_heads, head_size = 4, 4, 64
@@ -304,7 +413,7 @@ class TestQueryRotationTrick:
             k_cache, k_norms, tq, torch.float32,
         )
         k_rot_tokens = k_rotated[0, :num_tokens]
-        q_rot = query.float() @ tq.rotation.T
+        q_rot = tq.rotate_forward(query)
         dot_rotated = torch.einsum(
             "nhd,nhd->nh", q_rot, k_rot_tokens,
         )
@@ -333,7 +442,7 @@ class TestCacheShape:
         head_size = 128
         p_dim = packed_dim(head_size, TURBOQUANT_BIT_WIDTH)
         fp16_bytes = head_size * 2
-        tq_bytes = p_dim * 1 + 4  # packed + float32 norm
+        tq_bytes = p_dim * 1 + 4
         ratio = fp16_bytes / tq_bytes
         assert ratio > 7.0, f"Expected >7x compression, got {ratio:.1f}x"
 
