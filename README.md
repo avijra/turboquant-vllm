@@ -17,10 +17,11 @@ TurboQuant compresses the KV cache to **2 bits per coordinate** using data-obliv
 
 ## How It Works
 
-1. **Random orthogonal rotation** — Each KV vector is rotated by a fixed matrix Π, making coordinate distributions follow a Beta distribution regardless of the model.
+1. **Randomized Hadamard rotation** — Each KV vector is rotated by a fast Walsh-Hadamard transform with random sign flips (O(d log d) butterfly, not O(d²) matmul). This makes coordinate distributions follow a Beta distribution regardless of the model. Stores only d random signs (512 B) instead of a d×d matrix (64 KB per layer).
 2. **Optimal scalar quantizer** — Lloyd-Max codebook computed analytically for the Beta distribution. No training data needed.
 3. **Sub-byte packing** — 4 indices packed per `uint8` byte at 2-bit precision.
-4. **Query-rotation trick** — Instead of inverse-rotating every cached KV entry at read time, the query is rotated once by Π. Same dot products, far less work.
+4. **Query-rotation trick** — Instead of inverse-rotating every cached KV entry at read time, the query is rotated once. Same dot products, far less work.
+5. **Vectorized scatter** — Write path uses batched advanced indexing instead of per-token Python loops, eliminating GPU-pinning `.item()` calls.
 
 ## Project Structure
 
