@@ -12,10 +12,10 @@ Rotation modes:
   - "matrix": Full random orthogonal matrix via QR decomposition.
     O(d²) per vector, stores d×d float32 (64 KB for d=128).
 
-Storage layout per token per KV head (2-bit, head_size=128):
-  - 32 bytes packed indices (4 values per uint8)
+Storage layout per token per KV head (4-bit default, head_size=128):
+  - 64 bytes packed indices (2 values per uint8)
   - 4 bytes float32 norm (stored in separate auxiliary buffer)
-  Total: 36 bytes vs 256 bytes fp16 → 7.1× compression
+  Total: 68 bytes vs 256 bytes fp16 → 3.76× compression
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ try:
 except ImportError:
     HAS_TRITON = False
 
-TURBOQUANT_BIT_WIDTH = 2
+TURBOQUANT_BIT_WIDTH = 4
 
 
 def packed_dim(head_size: int, bit_width: int = TURBOQUANT_BIT_WIDTH) -> int:
@@ -469,7 +469,7 @@ class TurboQuantState:
         self.centroids = centroids
         self.boundaries = boundaries
 
-        self._norm_caches: dict[tuple[int, int, int], torch.Tensor] = {}
+        self._norm_caches: dict[int, torch.Tensor] = {}
         self._use_triton = HAS_TRITON and device.type == "cuda"
 
     def rotate_forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -487,14 +487,18 @@ class TurboQuantState:
     def get_norm_cache(
         self, num_blocks: int, block_size: int, kv_idx: int,
     ) -> torch.Tensor:
-        key = (num_blocks, block_size, kv_idx)
-        if key not in self._norm_caches:
-            self._norm_caches[key] = torch.zeros(
-                num_blocks * block_size * self.num_kv_heads,
+        needed = num_blocks * block_size * self.num_kv_heads
+        buf = self._norm_caches.get(kv_idx)
+        if buf is None or buf.numel() < needed:
+            new_buf = torch.zeros(
+                needed,
                 dtype=torch.float32,
                 device=self.device,
             )
-        return self._norm_caches[key]
+            if buf is not None:
+                new_buf[:buf.numel()] = buf
+            self._norm_caches[kv_idx] = new_buf
+        return self._norm_caches[kv_idx][:needed]
 
 
 # ---------------------------------------------------------------------------
@@ -533,12 +537,10 @@ def turboquant_reshape_and_cache(
     block_size = key_cache.shape[1]
     num_heads = key.shape[1]
 
-    valid = slot_mapping >= 0
-    if not valid.any():
-        return
-    valid_slots = slot_mapping[valid]
-    block_idx = valid_slots // block_size
-    block_off = valid_slots % block_size
+    safe_slots = slot_mapping.clamp(min=0)
+    block_idx = safe_slots // block_size
+    block_off = safe_slots % block_size
+    valid_mask = (slot_mapping >= 0).unsqueeze(-1).unsqueeze(-1)
 
     for tensor, cache, norm_buf in [
         (key, key_cache, k_norm_cache),
@@ -553,7 +555,10 @@ def turboquant_reshape_and_cache(
         indices = torch.bucketize(rotated, boundaries)
         packed = _pytorch_pack(indices, head_size, bit_width)
 
-        cache[block_idx, block_off] = packed[valid].to(torch.uint8)
+        packed_masked = torch.where(
+            valid_mask, packed.to(cache.dtype), cache[block_idx, block_off],
+        )
+        cache[block_idx, block_off] = packed_masked
 
         flat_base = (
             block_idx * block_size * num_heads
@@ -565,7 +570,13 @@ def turboquant_reshape_and_cache(
         scatter_idx = (
             flat_base.unsqueeze(1) + head_offsets.unsqueeze(0)
         ).reshape(-1)
-        norm_vals = norms[valid, :, 0].reshape(-1)
+        norm_vals = norms[:, :, 0].reshape(-1)
+        valid_1d = (slot_mapping >= 0).unsqueeze(-1).expand(
+            -1, num_heads,
+        ).reshape(-1)
+        norm_vals = torch.where(
+            valid_1d, norm_vals, norm_buf[scatter_idx],
+        )
         norm_buf.scatter_(0, scatter_idx, norm_vals)
 
 

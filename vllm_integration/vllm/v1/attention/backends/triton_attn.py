@@ -34,9 +34,7 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
 )
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.attention.ops.turboquant_cache import (
-    TURBOQUANT_BIT_WIDTH,
     TurboQuantState,
-    packed_dim,
     turboquant_dequantize_for_attention,
     turboquant_reshape_and_cache,
 )
@@ -308,10 +306,7 @@ class TritonAttentionBackend(AttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
-        last_dim = head_size
-        if cache_dtype_str == "turboquant":
-            last_dim = packed_dim(head_size, TURBOQUANT_BIT_WIDTH)
-        return (num_blocks, 2, block_size, num_kv_heads, last_dim)
+        return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
     @staticmethod
     def get_kv_cache_stride_order(
@@ -561,6 +556,16 @@ class TritonAttentionImpl(AttentionImpl):
             output_scale=output_scale,
             mm_prefix_range=mm_prefix_range_tensor,
         )
+
+        if self.kv_cache_dtype == "turboquant" and self._tq_state is not None:
+            out_slice = output[:num_actual_tokens]
+            orig_shape = out_slice.shape
+            flat = out_slice.reshape(-1, self.head_size)
+            output[:num_actual_tokens] = (
+                self._tq_state.rotate_inverse(flat)
+                .to(out_slice.dtype)
+                .reshape(orig_shape)
+            )
 
         return output
 
